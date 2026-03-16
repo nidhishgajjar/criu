@@ -7,6 +7,7 @@ TST_NOFILE	:=				\
 		busyloop00			\
 		sleeping00			\
 		pid00				\
+		pidns_deep			\
 		caps00				\
 		caps01				\
 		wait00				\

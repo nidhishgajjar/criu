@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -751,6 +752,13 @@ static int collect_children(struct pstree_item *item)
 		c->pid->state = ret;
 		list_add_tail(&c->sibling, &item->children);
 
+		/* Store multi-level NSpid data for dump */
+		if (creds.n_nspids > 0) {
+			dmpi(c)->n_nspids = creds.n_nspids;
+			memcpy(dmpi(c)->nspids, creds.nspids,
+			       creds.n_nspids * sizeof(pid_t));
+		}
+
 		ret = seccomp_collect_entry(pid, creds.s.seccomp_mode);
 		if (ret < 0)
 			goto free;
@@ -1106,6 +1114,13 @@ int collect_pstree(void)
 
 	pr_info("Seized task %d, state %d\n", pid, ret);
 	root_item->pid->state = ret;
+
+	/* Store multi-level NSpid data for dump */
+	if (creds.n_nspids > 0) {
+		dmpi(root_item)->n_nspids = creds.n_nspids;
+		memcpy(dmpi(root_item)->nspids, creds.nspids,
+		       creds.n_nspids * sizeof(pid_t));
+	}
 
 	ret = seccomp_collect_entry(pid, creds.s.seccomp_mode);
 	if (ret < 0)

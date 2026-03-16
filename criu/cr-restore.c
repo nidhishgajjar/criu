@@ -396,7 +396,11 @@ static int populate_root_fd_off(void)
 
 static int populate_pid_proc(void)
 {
-	if (open_pid_proc(vpid(current)) < 0) {
+	/*
+	 * For multi-level PID namespaces, /proc shows the innermost
+	 * namespace PIDs. Use vpid_inner() to open the correct entry.
+	 */
+	if (open_pid_proc(vpid_inner(current)) < 0) {
 		pr_err("Can't open PROC_SELF\n");
 		return -1;
 	}
@@ -1203,17 +1207,39 @@ static inline int fork_with_pid(struct pstree_item *item)
 		}
 	} else {
 		if (!external_pidns) {
-			if (pid != INIT_PID) {
-				pr_err("First PID in a PID namespace needs to be %d and not %d\n", pid, INIT_PID);
+			/*
+			 * For multi-level PID namespaces, check the innermost
+			 * PID (which should be 1 for the namespace init).
+			 * vpid() returns the outermost PID (for tree keying).
+			 */
+			pid_t inner = vpid_inner(item);
+			if (inner != INIT_PID) {
+				pr_err("First PID in a PID namespace needs to be %d and not %d\n", inner, INIT_PID);
 				return -1;
 			}
 		}
 	}
 
 	if (kdat.has_clone3_set_tid) {
-		ret = clone3_with_pid_noasan(restore_task_with_children, &ca,
-					     (ca.clone_flags & ~(CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME)),
-					     SIGCHLD, pid);
+		/*
+		 * Build the set_tid array for clone3().
+		 * The kernel expects set_tid[0] = innermost PID,
+		 * set_tid[1] = parent ns PID, etc.
+		 * Our ns[] array is outermost-first, so we reverse it.
+		 */
+		pid_t set_tid[MAX_NS_NESTING];
+		size_t set_tid_size;
+		unsigned int lvl;
+
+		set_tid_size = item->pid->ns_level;
+		if (set_tid_size < 1)
+			set_tid_size = 1;
+		for (lvl = 0; lvl < set_tid_size; lvl++)
+			set_tid[lvl] = item->pid->ns[set_tid_size - 1 - lvl].virt;
+
+		ret = clone3_with_pids_noasan(restore_task_with_children, &ca,
+					      (ca.clone_flags & ~(CLONE_NEWNET | CLONE_NEWCGROUP | CLONE_NEWTIME)),
+					      SIGCHLD, set_tid, set_tid_size);
 	} else {
 		/*
 		 * Some kernel modules, such as network packet generator
@@ -1368,13 +1394,30 @@ static void restore_sid(void)
 	if (vpid(current) == current->sid) {
 		pr_info("Restoring %d to %d sid\n", vpid(current), current->sid);
 		sid = setsid();
-		if (sid != current->sid) {
+		/*
+		 * setsid() returns the PID as seen from inside the
+		 * current namespace. For multi-level pidns, compare
+		 * against the innermost PID.
+		 */
+		if (sid != vpid_inner(current)) {
 			pr_perror("Can't restore sid (%d)", sid);
 			exit(1);
 		}
 	} else {
 		sid = getsid(0);
 		if (sid != current->sid) {
+			/*
+			 * For multi-level PID namespaces, getsid() returns the
+			 * innermost PID of the session leader. Check if the
+			 * inherited sid matches the innermost PID of the item
+			 * whose outermost PID equals current->sid.
+			 */
+			if (current->pid->ns_level > 1) {
+				struct pstree_item *leader;
+				leader = pstree_item_by_virt(current->sid);
+				if (leader && vpid_inner(leader) == sid)
+					return;
+			}
 			/* Skip the root task if it's not init */
 			if (current == root_item && vpid(root_item) != INIT_PID)
 				return;
@@ -1404,6 +1447,18 @@ static void restore_pgid(void)
 	if (my_pgid == pgid)
 		return;
 
+	/*
+	 * For multi-level PID namespaces: if this process is its own
+	 * pgid leader and the current pgid matches the innermost PID,
+	 * the pgid is already correct (set by setsid/setpgid).
+	 * Signal the futex before returning so children don't deadlock.
+	 */
+	if (current->pid->ns_level > 1 && my_pgid == vpid(current) &&
+	    pgid == vpid_inner(current)) {
+		futex_set_and_wake(&rsti(current)->pgrp_set, 1);
+		return;
+	}
+
 	if (my_pgid != vpid(current)) {
 		struct pstree_item *leader;
 
@@ -1420,10 +1475,35 @@ static void restore_pgid(void)
 		}
 	}
 
-	pr_info("\twill call setpgid, mine pgid is %d\n", pgid);
-	if (setpgid(0, my_pgid) != 0) {
-		pr_perror("Can't restore pgid (%d/%d->%d)", vpid(current), pgid, current->pgid);
-		exit(1);
+	/*
+	 * For multi-level PID namespaces, setpgid() operates on the
+	 * innermost namespace PID, not the outermost. If this process
+	 * is its own group leader, use the innermost PID.
+	 */
+	{
+		pid_t pgid_to_set = my_pgid;
+
+		if (current->pid->ns_level > 1) {
+			/*
+			 * For multi-level PID namespaces, translate the pgid
+			 * from outermost to innermost PID. setpgid() operates
+			 * on PIDs as seen in the current namespace.
+			 */
+			if (my_pgid == vpid(current)) {
+				pgid_to_set = vpid_inner(current);
+			} else {
+				struct pstree_item *leader;
+				leader = pstree_item_by_virt(my_pgid);
+				if (leader)
+					pgid_to_set = vpid_inner(leader);
+			}
+		}
+
+		pr_info("\twill call setpgid, mine pgid is %d\n", pgid_to_set);
+		if (setpgid(0, pgid_to_set) != 0) {
+			pr_perror("Can't restore pgid (%d/%d->%d)", vpid(current), pgid, current->pgid);
+			exit(1);
+		}
 	}
 
 	if (my_pgid == vpid(current))
@@ -1541,8 +1621,13 @@ static int __restore_task_with_children(void *_arg)
 	}
 
 	pid = getpid();
-	if (vpid(current) != pid) {
-		pr_err("Pid %d do not match expected %d\n", pid, vpid(current));
+	/*
+	 * For multi-level PID namespaces, getpid() returns the innermost
+	 * PID (e.g. 1 inside the child ns), not the outermost PID.
+	 * Compare against vpid_inner() which returns ns[ns_level-1].virt.
+	 */
+	if (vpid_inner(current) != pid) {
+		pr_err("Pid %d do not match expected %d\n", pid, vpid_inner(current));
 		set_task_cr_err(EEXIST);
 		goto err;
 	}
@@ -2069,7 +2154,7 @@ static int restore_root_task(struct pstree_item *init)
 	if (prepare_namespace_before_tasks())
 		return -1;
 
-	if (vpid(init) == INIT_PID) {
+	if (vpid_inner(init) == INIT_PID) {
 		if (!(root_ns_mask & CLONE_NEWPID)) {
 			pr_err("This process tree can only be restored "
 			       "in a new pid namespace.\n"

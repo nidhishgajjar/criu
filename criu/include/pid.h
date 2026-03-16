@@ -6,6 +6,19 @@
 #include "rbtree.h"
 
 /*
+ * Maximum PID namespace nesting depth.
+ * Matches the kernel's MAX_PID_NS_LEVEL (32).
+ */
+#define MAX_NS_NESTING 32
+
+/*
+ * Default allocation size for ns[] entries in struct pid.
+ * This covers common nested PID namespace use cases without
+ * wasting excessive memory. Each extra level costs ~28 bytes.
+ */
+#define DEFAULT_NS_ALLOC 8
+
+/*
  * Task states, used in e.g. struct pid's state.
  */
 enum __criu_task_state {
@@ -37,9 +50,23 @@ struct pid {
 	int stop_signo;
 
 	/*
+	 * Number of PID namespace levels for this process.
+	 * 1 = single namespace (legacy), N = nested N levels deep.
+	 * ns[0] = outermost (root) PID, ns[ns_level-1] = innermost.
+	 */
+	unsigned int ns_level;
+
+	/*
 	 * The @virt pid is one which used in the image itself and keeps
 	 * the pid value to be restored. This pid fetched from the
 	 * dumpee context, because the dumpee might have own pid namespace.
+	 *
+	 * For N-level PID namespaces:
+	 *   ns[0].virt = PID in outermost (root) namespace
+	 *   ns[N-1].virt = PID in innermost namespace
+	 *
+	 * The rb-tree is keyed on ns[0].virt (outermost PID) which
+	 * is always unique across the process tree.
 	 */
 	struct {
 		pid_t virt;

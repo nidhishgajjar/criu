@@ -1111,7 +1111,7 @@ int dump_namespaces(struct pstree_item *item, unsigned int ns_flags)
 
 	pr_info("Dumping %d(%d)'s namespaces\n", ns_pid->ns[0].virt, ns_pid->real);
 
-	if ((ns_flags & CLONE_NEWPID) && ns_pid->ns[0].virt != INIT_PID) {
+	if ((ns_flags & CLONE_NEWPID) && pid_inner(ns_pid) != INIT_PID) {
 		char *val = NULL;
 
 		ns = lookup_ns_by_id(item->ids->pid_ns_id, &pid_ns_desc);
