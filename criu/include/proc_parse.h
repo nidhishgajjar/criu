@@ -4,6 +4,7 @@
 #include <sys/types.h>
 
 #include "compel/infect.h"
+#include "pid.h"
 
 #define PROC_TASK_COMM_LEN     32
 #define PROC_TASK_COMM_LEN_FMT "(%31s"
@@ -72,6 +73,15 @@ struct proc_status_creds {
 	unsigned int gids[4];
 
 	u32 last_filter;
+
+	/*
+	 * Full NSpid hierarchy from /proc/pid/status.
+	 * nspids[0] = outermost (root ns) PID
+	 * nspids[n_nspids-1] = innermost PID
+	 * n_nspids == 0 means not yet parsed.
+	 */
+	unsigned int n_nspids;
+	pid_t nspids[MAX_NS_NESTING];
 
 	/*
 	 * Keep them at the end of structure

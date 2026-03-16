@@ -37,6 +37,32 @@ static inline pid_t vpid(const struct pstree_item *i)
 	return i->pid->ns[0].virt;
 }
 
+/*
+ * Return the innermost PID for a process. For single-level
+ * namespaces this is the same as vpid(). For N-level nested
+ * namespaces, this returns ns[ns_level-1].virt.
+ */
+static inline pid_t vpid_inner(const struct pstree_item *i)
+{
+	unsigned int level = i->pid->ns_level;
+
+	if (level == 0)
+		level = 1;
+	return i->pid->ns[level - 1].virt;
+}
+
+/*
+ * Return the innermost PID for a raw pid struct (e.g. threads).
+ */
+static inline pid_t pid_inner(const struct pid *p)
+{
+	unsigned int level = p->ns_level;
+
+	if (level == 0)
+		level = 1;
+	return p->ns[level - 1].virt;
+}
+
 enum {
 	FDS_EVENT_BIT = 0,
 };
@@ -59,6 +85,13 @@ struct thread_lsm {
 struct ns_id;
 struct dmp_info {
 	struct ns_id *netns;
+
+	/*
+	 * Full NSpid hierarchy from /proc/pid/status during seize.
+	 * nspids[0] = outermost, nspids[n_nspids-1] = innermost.
+	 */
+	unsigned int n_nspids;
+	pid_t nspids[MAX_NS_NESTING];
 	struct page_pipe *mem_pp;
 	struct parasite_ctl *parasite_ctl;
 	struct parasite_thread_ctl **thread_ctls;
@@ -96,6 +129,8 @@ static inline bool task_alive(struct pstree_item *i)
 
 extern void free_pstree(struct pstree_item *root_item);
 extern struct pstree_item *__alloc_pstree_item(bool rst);
+extern struct pstree_item *__alloc_pstree_item_levels(bool rst,
+						      unsigned int ns_levels);
 #define alloc_pstree_item() __alloc_pstree_item(false)
 extern int init_pstree_helper(struct pstree_item *ret);
 

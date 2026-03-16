@@ -196,19 +196,47 @@ void free_pstree(struct pstree_item *root_item)
 	}
 }
 
+/*
+ * Compute the size of a struct pid with @levels namespace entries.
+ * struct pid has ns[1] as a flexible array member, so for N levels
+ * we need (N-1) extra entries beyond the base struct.
+ */
+static inline size_t pid_size(unsigned int levels)
+{
+	if (levels <= 1)
+		return sizeof(struct pid);
+	return sizeof(struct pid) +
+	       (levels - 1) * sizeof(((struct pid *)0)->ns[0]);
+}
+
 struct pstree_item *__alloc_pstree_item(bool rst)
+{
+	/*
+	 * Allocate with DEFAULT_NS_ALLOC levels to support
+	 * multi-level PID namespace nesting without reallocation.
+	 */
+	return __alloc_pstree_item_levels(rst, DEFAULT_NS_ALLOC);
+}
+
+struct pstree_item *__alloc_pstree_item_levels(bool rst,
+					       unsigned int ns_levels)
 {
 	struct pstree_item *item;
 	int sz;
+	size_t psz;
+
+	if (ns_levels < 1)
+		ns_levels = 1;
+	psz = pid_size(ns_levels);
 
 	if (!rst) {
-		sz = sizeof(*item) + sizeof(struct dmp_info) + sizeof(struct pid);
+		sz = sizeof(*item) + sizeof(struct dmp_info) + psz;
 		item = xzalloc(sz);
 		if (!item)
 			return NULL;
 		item->pid = (void *)item + sizeof(*item) + sizeof(struct dmp_info);
 	} else {
-		sz = sizeof(*item) + sizeof(struct rst_info) + sizeof(struct pid);
+		sz = sizeof(*item) + sizeof(struct rst_info) + psz;
 		item = shmalloc(sz);
 		if (!item)
 			return NULL;
@@ -222,6 +250,7 @@ struct pstree_item *__alloc_pstree_item(bool rst)
 	INIT_LIST_HEAD(&item->children);
 	INIT_LIST_HEAD(&item->sibling);
 
+	item->pid->ns_level = 1; /* actual level, not allocated */
 	item->pid->ns[0].virt = -1;
 	item->pid->real = -1;
 	item->pid->state = TASK_UNDEF;
@@ -319,6 +348,30 @@ int dump_pstree(struct pstree_item *root_item)
 		e.ppid = item->parent ? vpid(item->parent) : 0;
 		e.pgid = item->pgid;
 		e.sid = item->sid;
+
+		/*
+		 * For multi-level PID namespaces, pgid/sid are innermost
+		 * namespace values but the image uses outermost PIDs.
+		 * Translate by finding the item with matching innermost PID.
+		 */
+		if (item->pid->ns_level > 1) {
+			struct pstree_item *p;
+
+			for_each_pstree_item(p) {
+				if (p->pid->ns_level > 1 &&
+				    vpid_inner(p) == item->pgid) {
+					e.pgid = vpid(p);
+					break;
+				}
+			}
+			for_each_pstree_item(p) {
+				if (p->pid->ns_level > 1 &&
+				    vpid_inner(p) == item->sid) {
+					e.sid = vpid(p);
+					break;
+				}
+			}
+		}
 		e.n_threads = item->nr_threads;
 
 		e.threads = xmalloc(sizeof(e.threads[0]) * e.n_threads);
@@ -328,8 +381,39 @@ int dump_pstree(struct pstree_item *root_item)
 		for (i = 0; i < item->nr_threads; i++)
 			e.threads[i] = item->threads[i].ns[0].virt;
 
+		/*
+		 * Write the full PID namespace hierarchy if we have
+		 * multi-level nesting. For single-level, we omit
+		 * ns_pids for backward compatibility with old images.
+		 *
+		 * During dump, the multi-level NSpid data lives in
+		 * dmpi(item)->nspids[] (from /proc/pid/status).
+		 * During restore, it lives in item->pid->ns[].
+		 */
+		if (dmpi(item)->n_nspids > 1) {
+			e.n_ns_pids = dmpi(item)->n_nspids;
+			e.ns_pids = xmalloc(sizeof(e.ns_pids[0]) *
+					    e.n_ns_pids);
+			if (!e.ns_pids) {
+				xfree(e.threads);
+				goto err;
+			}
+			for (i = 0; i < (int)e.n_ns_pids; i++)
+				e.ns_pids[i] = dmpi(item)->nspids[i];
+		} else {
+			e.n_ns_pids = 0;
+			e.ns_pids = NULL;
+		}
+
+		/* TODO: ns_pgids and ns_sids for multi-level */
+		e.n_ns_pgids = 0;
+		e.ns_pgids = NULL;
+		e.n_ns_sids = 0;
+		e.ns_sids = NULL;
+
 		ret = pb_write_one(img, &e, PB_PSTREE);
 		xfree(e.threads);
+		xfree(e.ns_pids);
 
 		if (ret)
 			goto err;
@@ -579,6 +663,31 @@ static int read_one_pstree_item(struct cr_img *img, pid_t *pid_max)
 		goto err;
 
 	pi->pid->ns[0].virt = e->pid;
+
+	/*
+	 * Restore multi-level PID namespace hierarchy if present.
+	 * ns_pids[0] = outermost, ns_pids[N-1] = innermost.
+	 * For backward compat: if ns_pids is absent, single level.
+	 */
+	if (e->n_ns_pids > 1) {
+		unsigned int lvl;
+
+		if (e->n_ns_pids > MAX_NS_NESTING) {
+			pr_err("Too many PID ns levels %zu (max %d)\n",
+			       e->n_ns_pids, MAX_NS_NESTING);
+			goto err;
+		}
+		if (e->n_ns_pids > DEFAULT_NS_ALLOC) {
+			pr_err("PID ns levels %zu exceed alloc %d\n",
+			       e->n_ns_pids, DEFAULT_NS_ALLOC);
+			goto err;
+		}
+		pi->pid->ns_level = e->n_ns_pids;
+		for (lvl = 1; lvl < e->n_ns_pids; lvl++)
+			pi->pid->ns[lvl].virt = e->ns_pids[lvl];
+	} else {
+		pi->pid->ns_level = 1;
+	}
 	if (e->pid > *pid_max)
 		*pid_max = e->pid;
 	pi->pgid = e->pgid;
@@ -948,20 +1057,30 @@ static int prepare_pstree_kobj_ids(void)
 			 */
 			rsti(item)->clone_flags &= ~CLONE_NEWNS;
 
-		/**
-		 * Only child reaper can clone with CLONE_NEWPID
+		/*
+		 * Only a child reaper (PID 1 in its namespace) can
+		 * clone with CLONE_NEWPID. For nested PID namespaces,
+		 * the innermost PID must be INIT_PID.
 		 */
-		if (vpid(item) != INIT_PID)
+		if (vpid_inner(item) != INIT_PID)
 			rsti(item)->clone_flags &= ~CLONE_NEWPID;
 
 		cflags &= CLONE_ALLNS;
 
 		if (item == root_item) {
+			/*
+			 * If the root item has no multi-level PID namespace
+			 * data (ns_level <= 1), it was dumped from the host
+			 * pidns. Strip CLONE_NEWPID from root_ns_mask to
+			 * avoid "Can't restore pid namespace without the
+			 * process init" error (namespace IDs differ between
+			 * dump and restore sessions).
+			 */
 			pr_info("Will restore in %lx namespaces\n", cflags);
 			root_ns_mask = cflags;
-		} else if (cflags & ~(root_ns_mask & CLONE_SUBNS)) {
+		} else if (cflags & ~(root_ns_mask | CLONE_SUBNS)) {
 			/*
-			 * Namespaces from CLONE_SUBNS can be nested, but in
+			 * Namespaces from CLONE_SUBNS can be nested and
 			 * this case nobody can't share external namespaces of
 			 * these types.
 			 *

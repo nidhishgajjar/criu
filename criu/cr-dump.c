@@ -1529,7 +1529,14 @@ static int pre_dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie
 		goto err_cure;
 	}
 
-	item->pid->ns[0].virt = misc.pid;
+	if (dmpi(item)->n_nspids > 1) {
+		unsigned int i;
+		item->pid->ns_level = dmpi(item)->n_nspids;
+		for (i = 0; i < dmpi(item)->n_nspids; i++)
+			item->pid->ns[i].virt = dmpi(item)->nspids[i];
+	} else {
+		item->pid->ns[0].virt = misc.pid;
+	}
 
 	mdc.pre_dump = true;
 	mdc.lazy = false;
@@ -1670,11 +1677,41 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
-	item->pid->ns[0].virt = misc.pid;
-	item->threads[0].ns[0].virt = misc.pid;
+	/*
+	 * For multi-level PID namespaces, ns[0] = outermost (host) PID,
+	 * ns[N-1] = innermost PID. The rb-tree is keyed on ns[0] (host PID)
+	 * which is always unique. For single-level, ns[0] = misc.pid.
+	 */
+	if (dmpi(item)->n_nspids > 1) {
+		unsigned int i;
+		item->pid->ns_level = dmpi(item)->n_nspids;
+		for (i = 0; i < dmpi(item)->n_nspids; i++)
+			item->pid->ns[i].virt = dmpi(item)->nspids[i];
+		item->threads[0].ns[0].virt = dmpi(item)->nspids[0];
+	} else {
+		item->pid->ns[0].virt = misc.pid;
+		item->threads[0].ns[0].virt = misc.pid;
+	}
 	pstree_insert_pid(item->pid);
-	item->sid = misc.sid;
-	item->pgid = misc.pgid;
+
+	/*
+	 * For multi-level PID namespaces, sid/pgid from the parasite
+	 * are innermost namespace values. Translate to outermost PIDs
+	 * for the pstree image (the rb-tree is keyed on outermost PIDs).
+	 *
+	 * If the process is a session leader (sid == own innermost pid)
+	 * or process group leader (pgid == own innermost pid), use the
+	 * outermost PID. Otherwise, leave as-is (will be resolved during
+	 * the pstree fixup pass on restore).
+	 */
+	if (dmpi(item)->n_nspids > 1) {
+		pid_t inner = dmpi(item)->nspids[dmpi(item)->n_nspids - 1];
+		item->sid = (misc.sid == inner) ? vpid(item) : misc.sid;
+		item->pgid = (misc.pgid == inner) ? vpid(item) : misc.pgid;
+	} else {
+		item->sid = misc.sid;
+		item->pgid = misc.pgid;
+	}
 
 	pr_info("sid=%d pgid=%d pid=%d\n", item->sid, item->pgid, vpid(item));
 

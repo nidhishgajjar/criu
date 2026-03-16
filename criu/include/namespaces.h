@@ -46,7 +46,7 @@
 	 CLONE_NEWTIME)
 
 /* Nested namespaces are supported only for these types */
-#define CLONE_SUBNS (CLONE_NEWNS | CLONE_NEWNET)
+#define CLONE_SUBNS (CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWPID)
 
 #define EXTRA_SIZE 20
 
@@ -99,6 +99,7 @@ struct ns_id {
 	pid_t ns_pid;
 	struct ns_desc *nd;
 	struct ns_id *next;
+	struct ns_id *parent;	/* parent namespace (for PID ns hierarchy) */
 	enum ns_type type;
 	char *ext_key;
 

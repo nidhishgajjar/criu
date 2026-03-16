@@ -1102,6 +1102,7 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 	cr->s.shdpnd = 0;
 	cr->s.sigblk = 0;
 	cr->s.seccomp_mode = SECCOMP_MODE_DISABLED;
+	cr->n_nspids = 0;
 
 	if (bfdopenr(&f))
 		return -1;
@@ -1129,14 +1130,36 @@ int parse_pid_status(pid_t pid, struct seize_task_status *ss, void *data)
 		}
 
 		if (!strncmp(str, "NSpid:", 6)) {
-			/* Get a thread ID in the thread PID namespace. */
-			char *last;
+			/*
+			 * Parse all PID namespace levels from NSpid line.
+			 * Format: "NSpid:\t1234\t56\t1"
+			 * First value = outermost (root), last = innermost.
+			 */
+			char *p = str + 6;
+			unsigned int n = 0;
 
-			last = strrchr(str, '\t');
-			if (!last || sscanf(last, "%d", &cr->s.vpid) != 1) {
+			while (*p && n < MAX_NS_NESTING) {
+				while (*p == '\t' || *p == ' ')
+					p++;
+				if (*p == '\0' || *p == '\n')
+					break;
+				if (sscanf(p, "%d", &cr->nspids[n]) != 1) {
+					pr_err("Unable to parse NSpid level %u: %s\n",
+					       n, str);
+					goto err_parse;
+				}
+				n++;
+				/* Skip to next tab/space/end */
+				while (*p && *p != '\t' && *p != ' ' && *p != '\n')
+					p++;
+			}
+			if (n == 0) {
 				pr_err("Unable to parse: %s\n", str);
 				goto err_parse;
 			}
+			cr->n_nspids = n;
+			/* Keep backward compat: vpid = innermost PID */
+			cr->s.vpid = cr->nspids[n - 1];
 
 			done++;
 			continue;
