@@ -407,6 +407,18 @@ inline int open_pid_proc(pid_t pid)
 		snprintf(path, sizeof(path), "%d", pid);
 
 	fd = openat(dfd, path, O_PATH);
+	if (fd < 0 && errno == ENOENT) {
+		/*
+		 * The /proc service FD may have been clobbered (closed and
+		 * reused by other code) when service_fd_base == 0 (dump mode).
+		 * Reopen /proc and retry before giving up.
+		 */
+		if (open_proc_sfd("/proc") == 0) {
+			dfd = get_service_fd(PROC_FD_OFF);
+			if (dfd >= 0)
+				fd = openat(dfd, path, O_PATH);
+		}
+	}
 	if (fd < 0) {
 		pr_perror("Can't open %s", path);
 		set_cr_errno(ESRCH);
