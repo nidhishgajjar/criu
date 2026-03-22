@@ -1434,7 +1434,14 @@ static int tty_find_restoring_task(struct tty_info *info)
 			return prepare_ctl_tty(item, info->tfe->id);
 		}
 
-		goto notask;
+		/*
+		 * Session leader not found — fall through to shell_job
+		 * handling which can inherit the terminal instead of
+		 * failing. This happens when restoring into a different
+		 * session context (e.g. agent checkpoint/restore).
+		 */
+		pr_warn("Session leader %d not found, trying shell_job fallback\n", info->tie->sid);
+		goto shell_job;
 	} else {
 		if (tty_is_master(info))
 			return 0;
@@ -1449,7 +1456,6 @@ shell_job:
 		return 0;
 	}
 
-notask:
 	pr_err("No task found with sid %d\n", info->tie->sid);
 	return -1;
 }
