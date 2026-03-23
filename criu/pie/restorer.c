@@ -172,6 +172,23 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 
 	pr_info("Task %d %s %d\n", siginfo->si_pid, r, siginfo->si_status);
 
+	/*
+	 * If a child exited cleanly (status 0), record it and continue.
+	 * Transient subprocesses (tmux helpers, one-shot tasks) may finish
+	 * between checkpoint and restore. The main process tree is intact.
+	 * Record the PID so CRIU parent skips it during ptrace cleanup,
+	 * and decrement the stage counter so synchronization doesn't deadlock.
+	 */
+	if (siginfo->si_code == CLD_EXITED && siginfo->si_status == 0) {
+		int idx;
+		atomic_inc(&task_entries_local->nr_exited_early);
+		idx = atomic_read(&task_entries_local->nr_exited_early);
+		if (idx > 0 && idx <= MAX_EARLY_EXITS)
+			task_entries_local->exited_pids[idx - 1] = siginfo->si_pid;
+		futex_dec_and_wake(&task_entries_local->nr_in_progress);
+		return;
+	}
+
 	futex_abort_and_wake(&task_entries_local->nr_in_progress);
 	/* sa_restorer may be unmaped, so we can't go back to userspace*/
 	sys_kill(sys_getpid(), SIGSTOP);

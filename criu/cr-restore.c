@@ -135,6 +135,9 @@ int __attribute__((weak)) arch_set_thread_regs_nosigrt(struct pid *pid)
 
 static inline int stage_participants(int next_stage)
 {
+	int exited = atomic_read(&task_entries->nr_exited_early);
+	int count;
+
 	switch (next_stage) {
 	case CR_STATE_FAIL:
 		return 0;
@@ -142,16 +145,41 @@ static inline int stage_participants(int next_stage)
 	case CR_STATE_PREPARE_NAMESPACES:
 		return 1;
 	case CR_STATE_FORKING:
-		return task_entries->nr_tasks + task_entries->nr_helpers;
+		count = task_entries->nr_tasks + task_entries->nr_helpers;
+		break;
 	case CR_STATE_RESTORE:
-		return task_entries->nr_threads + task_entries->nr_helpers;
+		count = task_entries->nr_threads + task_entries->nr_helpers;
+		break;
 	case CR_STATE_RESTORE_SIGCHLD:
 	case CR_STATE_RESTORE_CREDS:
-		return task_entries->nr_threads;
+		count = task_entries->nr_threads;
+		break;
+	default:
+		BUG();
+		return -1;
 	}
 
-	BUG();
-	return -1;
+	/* Subtract tasks that exited cleanly during restore */
+	if (exited > 0 && count > exited)
+		count -= exited;
+	return count;
+}
+
+/* Check if a PID exited cleanly during restore (recorded by restorer blob) */
+static bool pid_exited_early(pid_t pid)
+{
+	int n = atomic_read(&task_entries->nr_exited_early);
+	int i;
+
+	if (n <= 0)
+		return false;
+	if (n > MAX_EARLY_EXITS)
+		n = MAX_EARLY_EXITS;
+	for (i = 0; i < n; i++) {
+		if (task_entries->exited_pids[i] == pid)
+			return true;
+	}
+	return false;
 }
 
 static inline int stage_current_participants(int next_stage)
@@ -1287,6 +1315,10 @@ static int sigchld_process(int status, pid_t pid)
 	int sig;
 
 	if (WIFEXITED(status)) {
+		if (WEXITSTATUS(status) == 0) {
+			pr_warn("%d exited cleanly (status 0) during restore\n", pid);
+			return 0;
+		}
 		pr_err("%d exited, status=%d\n", pid, WEXITSTATUS(status));
 		return -1;
 	} else if (WIFSIGNALED(status)) {
@@ -1819,6 +1851,10 @@ static int attach_to_tasks(bool root_seized)
 		if (!task_alive(item))
 			continue;
 
+		/* Skip tasks that exited cleanly during restore */
+		if (pid_exited_early(vpid(item)))
+			continue;
+
 		if (item->nr_threads == 1) {
 			item->threads[0].real = item->pid->real;
 		} else {
@@ -1831,11 +1867,19 @@ static int attach_to_tasks(bool root_seized)
 
 			if (item != root_item || !root_seized || i != 0) {
 				if (ptrace(PTRACE_SEIZE, pid, 0, 0)) {
+					if (errno == ESRCH && pid_exited_early(vpid(item))) {
+						pr_warn("Skipping exited task %d\n", pid);
+						continue;
+					}
 					pr_perror("Can't attach to %d", pid);
 					return -1;
 				}
 			}
 			if (ptrace(PTRACE_INTERRUPT, pid, 0, 0)) {
+				if (errno == ESRCH && pid_exited_early(vpid(item))) {
+					pr_warn("Skipping exited task %d\n", pid);
+					continue;
+				}
 				pr_perror("Can't interrupt the %d task", pid);
 				return -1;
 			}
@@ -1846,16 +1890,26 @@ static int attach_to_tasks(bool root_seized)
 
 		if (!task_alive(item))
 			continue;
+		if (pid_exited_early(vpid(item)))
+			continue;
 
 		for (i = 0; i < item->nr_threads; i++) {
 			pid_t pid = item->threads[i].real;
 
 			if (wait4(pid, &status, __WALL, NULL) != pid) {
+				if (errno == ESRCH || errno == ECHILD) {
+					pr_warn("Task %d exited during attach_to_tasks wait, skipping\n", pid);
+					continue;
+				}
 				pr_perror("waitpid(%d) failed", pid);
 				return -1;
 			}
 
 			if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD)) {
+				if (errno == ESRCH) {
+					pr_warn("Task %d exited during attach SETOPTIONS, skipping\n", pid);
+					continue;
+				}
 				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
 				return -1;
 			}
@@ -1872,6 +1926,10 @@ static int attach_to_tasks(bool root_seized)
 				pr_err("failed to suspend seccomp, restore will probably fail...\n");
 
 			if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
+				if (errno == ESRCH) {
+					pr_warn("Task %d exited during attach CONT, skipping\n", pid);
+					continue;
+				}
 				pr_perror("Unable to resume %d", pid);
 				return -1;
 			}
@@ -1889,6 +1947,8 @@ static int restore_rseq_cs(void)
 		int i;
 
 		if (!task_alive(item))
+			continue;
+		if (pid_exited_early(vpid(item)))
 			continue;
 
 		if (item->nr_threads == 1) {
@@ -1916,6 +1976,10 @@ static int restore_rseq_cs(void)
 				    pid, &rseqe[i].rseq_cs_pointer,
 				    decode_pointer(rseqe[i].rseq_abi_pointer + offsetof(struct criu_rseq, rseq_cs)),
 				    sizeof(uint64_t))) {
+				if (errno == ESRCH) {
+					pr_warn("Task %d exited during rseq_cs restore, skipping\n", pid);
+					continue;
+				}
 				pr_err("Can't restore rseq_cs pointer (pid: %d)\n", pid);
 				return -1;
 			}
@@ -1929,11 +1993,14 @@ static int catch_tasks(pid_t *pids, int nr_tasks)
 {
 	struct pstree_item *item;
 	int npids = 0;
+	int exited = atomic_read(&task_entries->nr_exited_early);
 
 	for_each_pstree_item(item) {
 		int i;
 
 		if (!task_alive(item))
+			continue;
+		if (pid_exited_early(vpid(item)))
 			continue;
 
 		for (i = 0; i < item->nr_threads; i++) {
@@ -1956,28 +2023,44 @@ static int catch_tasks(pid_t *pids, int nr_tasks)
 
 		if (!task_alive(item))
 			continue;
+		if (pid_exited_early(vpid(item)))
+			continue;
 
 		for (i = 0; i < item->nr_threads; i++) {
 			pid_t pid = item->threads[i].real;
 
 			if (wait4(pid, &status, __WALL, NULL) != pid) {
+				if (errno == ESRCH || errno == ECHILD) {
+					pr_warn("Task %d exited during catch_tasks wait, skipping\n", pid);
+					npids--;
+					continue;
+				}
 				pr_perror("waitpid(%d) failed", pid);
 				return -1;
 			}
 
 			if (ptrace(PTRACE_SYSCALL, pid, NULL, NULL)) {
+				if (errno == ESRCH) {
+					pr_warn("Task %d exited during catch_tasks resume, skipping\n", pid);
+					npids--;
+					continue;
+				}
 				pr_perror("Unable to resume the %d process", pid);
 				return -1;
 			}
 		}
 	}
 
-	if (npids != nr_tasks) {
+	if (exited == 0 && npids != nr_tasks) {
 		pr_err("Captured %d tasks, but %d expected\n", npids, nr_tasks);
 		return -1;
 	}
+	if (exited > 0) {
+		pr_info("Captured %d tasks (%d exited early, %d expected)\n",
+			npids, exited, nr_tasks);
+	}
 
-	return 0;
+	return npids;
 }
 
 static void finalize_restore(void)
@@ -1991,6 +2074,14 @@ static void finalize_restore(void)
 
 		if (!task_alive(item))
 			continue;
+		if (pid_exited_early(vpid(item)))
+			continue;
+
+		/* Skip tasks that exited after restore */
+		if (kill(pid, 0) == -1 && errno == ESRCH) {
+			pr_warn("Task %d exited before finalize, skipping\n", pid);
+			continue;
+		}
 
 		/* Unmap the restorer blob */
 		ctl = compel_prepare_noctx(pid);
@@ -2024,6 +2115,8 @@ static int finalize_restore_detach(void)
 
 		if (!task_alive(item))
 			continue;
+		if (pid_exited_early(vpid(item)))
+			continue;
 
 		for (i = 0; i < item->nr_threads; i++) {
 			pid = item->threads[i].real;
@@ -2033,10 +2126,18 @@ static int finalize_restore_detach(void)
 			}
 
 			if (arch_set_thread_regs_nosigrt(&item->threads[i])) {
+				if (errno == ESRCH) {
+					pr_warn("Task %d exited during regs restore, skipping\n", pid);
+					continue;
+				}
 				pr_perror("Restoring regs for %d failed", pid);
 				return -1;
 			}
 			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
+				if (errno == ESRCH) {
+					pr_warn("Task %d exited during detach, skipping\n", pid);
+					continue;
+				}
 				pr_perror("Unable to detach %d", pid);
 				return -1;
 			}
@@ -2122,6 +2223,7 @@ static int restore_root_task(struct pstree_item *init)
 {
 	int ret, fd, mnt_ns_fd = -1;
 	int root_seized = 0;
+	int nr_pids = 0;
 	struct pstree_item *item;
 	pid_t *pids = NULL;
 
@@ -2345,7 +2447,8 @@ skip_ns_bouncing:
 	pids = xzalloc(sizeof(pid_t) * task_entries->nr_threads);
 	if (!pids)
 		goto out_kill_network_unlocked;
-	if (catch_tasks(pids, task_entries->nr_threads)) {
+	nr_pids = catch_tasks(pids, task_entries->nr_threads);
+	if (nr_pids < 0) {
 		pr_err("Can't catch all tasks\n");
 		goto out_kill_network_unlocked;
 	}
@@ -2355,7 +2458,7 @@ skip_ns_bouncing:
 
 	__restore_switch_stage(CR_STATE_COMPLETE);
 
-	ret = compel_stop_tasks_on_syscall(task_entries->nr_threads, pids, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1));
+	ret = compel_stop_tasks_on_syscall(nr_pids, pids, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1));
 	if (ret) {
 		pr_err("Can't stop all tasks on rt_sigreturn\n");
 		goto out_kill_network_unlocked;
@@ -2381,6 +2484,8 @@ skip_ns_bouncing:
 	pr_info("Run late stage hook from criu master for external devices\n");
 	for_each_pstree_item(item) {
 		if (!task_alive(item))
+			continue;
+		if (pid_exited_early(vpid(item)))
 			continue;
 		ret = run_plugins(RESUME_DEVICES_LATE, item->pid->real);
 		/*
@@ -2467,6 +2572,8 @@ int prepare_task_entries(void)
 	task_entries->nr_threads = 0;
 	task_entries->nr_tasks = 0;
 	task_entries->nr_helpers = 0;
+	atomic_set(&task_entries->nr_exited_early, 0);
+	memset(task_entries->exited_pids, 0, sizeof(task_entries->exited_pids));
 	futex_set(&task_entries->start, CR_STATE_FAIL);
 	mutex_init(&task_entries->userns_sync_lock);
 	mutex_init(&task_entries->cgroupd_sync_lock);
