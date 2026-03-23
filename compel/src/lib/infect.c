@@ -1746,6 +1746,11 @@ int compel_stop_tasks_on_syscall(int nr_tasks, pid_t *pids, const int sys_nr, co
 
 			pid = wait4(pid, &status, __WALL, NULL);
 			if (pid == -1) {
+				if (errno == ECHILD || errno == ESRCH) {
+					pr_warn("Task %d exited during stop_on_syscall, skipping\n", pids[i]);
+					done[i] = SYS_TRAP_TGT_EXIT;
+					continue;
+				}
 				pr_perror("wait4 failed");
 				goto err;
 			}

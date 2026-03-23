@@ -9,11 +9,15 @@
 #include "images/mm.pb-c.h"
 #include "images/core.pb-c.h"
 
+#define MAX_EARLY_EXITS 32
+
 struct task_entries {
 	int nr_threads, nr_tasks, nr_helpers;
 	futex_t nr_in_progress;
 	futex_t start;
 	atomic_t cr_err;
+	atomic_t nr_exited_early;	/* Tasks that exited cleanly mid-restore */
+	pid_t exited_pids[MAX_EARLY_EXITS]; /* PIDs of early-exited tasks */
 	mutex_t userns_sync_lock;
 	mutex_t cgroupd_sync_lock;
 	mutex_t last_pid_mutex;
