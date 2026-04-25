@@ -36,6 +36,88 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 
+/*
+ * External dirty page list — populated when --external-dirty-list is set.
+ * Sorted by start address; lookup via binary search. ORB v1.3.
+ */
+struct ext_dirty_range {
+	unsigned long start;	/* page-aligned virt addr */
+	unsigned long end;	/* exclusive */
+};
+static struct ext_dirty_range *ext_dirty_ranges;
+static size_t ext_dirty_count;
+
+static int load_external_dirty_list(const char *path)
+{
+	FILE *f;
+	char line[256];
+	size_t cap = 64;
+
+	f = fopen(path, "r");
+	if (!f) {
+		pr_perror("Can't open external dirty list %s", path);
+		return -1;
+	}
+
+	ext_dirty_ranges = xmalloc(sizeof(*ext_dirty_ranges) * cap);
+	if (!ext_dirty_ranges) {
+		fclose(f);
+		return -1;
+	}
+	ext_dirty_count = 0;
+
+	while (fgets(line, sizeof(line), f)) {
+		unsigned long start, len;
+		if (sscanf(line, "%lx,%lu", &start, &len) != 2)
+			continue;
+		if (ext_dirty_count >= cap) {
+			cap *= 2;
+			ext_dirty_ranges = xrealloc(ext_dirty_ranges,
+				sizeof(*ext_dirty_ranges) * cap);
+			if (!ext_dirty_ranges) {
+				fclose(f);
+				return -1;
+			}
+		}
+		ext_dirty_ranges[ext_dirty_count].start = start;
+		ext_dirty_ranges[ext_dirty_count].end = start + len;
+		ext_dirty_count++;
+	}
+	fclose(f);
+	pr_info("Loaded %zu external dirty ranges from %s\n", ext_dirty_count, path);
+	return 0;
+}
+
+static bool addr_is_externally_dirty(unsigned long va)
+{
+	size_t lo = 0, hi = ext_dirty_count;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (va < ext_dirty_ranges[mid].start)
+			hi = mid;
+		else if (va >= ext_dirty_ranges[mid].end)
+			lo = mid + 1;
+		else
+			return true;
+	}
+	return false;
+}
+
+int prepare_external_dirty_list(void)
+{
+	if (!opts.external_dirty_list)
+		return 0;
+	return load_external_dirty_list(opts.external_dirty_list);
+}
+
+void release_external_dirty_list(void)
+{
+	xfree(ext_dirty_ranges);
+	ext_dirty_ranges = NULL;
+	ext_dirty_count = 0;
+}
+
 static int task_reset_dirty_track(int pid)
 {
 	int ret;
@@ -93,11 +175,14 @@ static inline bool __page_is_zero(u64 pme)
 static inline bool __page_in_parent(bool dirty)
 {
 	/*
-	 * If we do memory tracking, but w/o parent images,
-	 * then we have to dump all memory
+	 * If we do memory tracking (kernel soft-dirty OR external dirty list),
+	 * with parent images, a clean page can be referenced from parent.
+	 * Without parent images, we have to dump all memory regardless.
 	 */
 
-	return opts.track_mem && opts.img_parent && !dirty;
+	return (opts.track_mem || opts.external_dirty_list)
+		&& opts.img_parent
+		&& !dirty;
 }
 
 static bool should_dump_entire_vma(VmaEntry *vmae)
@@ -254,7 +339,14 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * page. The latter would be checked in page-xfer.
 		 */
 
-		if (has_parent && page_in_parent(page_info.softdirty)) {
+		/*
+		 * "dirty" = page was written since the last reset.
+		 * Prefer external list (uffd-WP origin) when --external-dirty-list
+		 * is set. Otherwise fall back to kernel soft-dirty.
+		 */
+		if (has_parent && page_in_parent(opts.external_dirty_list ?
+				addr_is_externally_dirty(vaddr) :
+				page_info.softdirty)) {
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			st = 0;
 		} else {

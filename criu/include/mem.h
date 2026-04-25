@@ -58,4 +58,8 @@ struct page_info {
 
 int should_dump_page(pmc_t *pmc, VmaEntry *vmae, u64 vaddr, struct page_info *page_info);
 
+/* External dirty list (--external-dirty-list, ORB v1.3) */
+int prepare_external_dirty_list(void);
+void release_external_dirty_list(void);
+
 #endif /* __CR_MEM_H__ */

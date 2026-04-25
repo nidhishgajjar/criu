@@ -650,6 +650,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		{ "prev-images-dir", required_argument, 0, 1053 },
 		{ "ms", no_argument, 0, 1054 },
 		BOOL_OPT("track-mem", &opts.track_mem),
+		{ "external-dirty-list", required_argument, 0, 1101 },
 		BOOL_OPT("auto-dedup", &opts.auto_dedup),
 		{ "libdir", required_argument, 0, 'L' },
 		{ "cpu-cap", optional_argument, 0, 1057 },
@@ -1032,6 +1033,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		case 1099:
 			SET_CHAR_OPTS(lsm_mount_context, optarg);
 			break;
+		case 1101:
+			SET_CHAR_OPTS(external_dirty_list, optarg);
+			break;
 		case 1100:
 			has_network_lock_opt = true;
 			if (!strcmp("iptables", optarg)) {
@@ -1128,6 +1132,16 @@ int check_options(void)
 
 	if (opts.track_mem && !kdat.has_dirty_track) {
 		pr_err("Tracking memory is not available. Consider omitting --track-mem option.\n");
+		return 1;
+	}
+
+	if (opts.external_dirty_list && opts.track_mem) {
+		pr_err("--external-dirty-list and --track-mem are mutually exclusive.\n");
+		return 1;
+	}
+
+	if (opts.external_dirty_list && !opts.img_parent) {
+		pr_err("--external-dirty-list requires --prev-images-dir.\n");
 		return 1;
 	}
 

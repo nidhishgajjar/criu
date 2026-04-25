@@ -164,6 +164,14 @@ struct cr_options {
 	char *addr;
 	int ps_socket;
 	int track_mem;
+	/*
+	 * Path to external dirty page list (text, "<start_hex>,<len>" per line).
+	 * When set, dump skips pages NOT in the listed ranges and refers them to
+	 * --prev-images-dir (analogous to --track-mem soft-dirty path, but the
+	 * list comes from userspace — for kernels/arches without soft-dirty,
+	 * e.g. arm64 with userfaultfd-WP-based tracking). ORB v1.3.
+	 */
+	char *external_dirty_list;
 	char *img_parent;
 	int auto_dedup;
 	unsigned int cpu_cap;
