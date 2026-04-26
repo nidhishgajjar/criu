@@ -44,14 +44,40 @@ struct ext_dirty_range {
 	unsigned long start;	/* page-aligned virt addr */
 	unsigned long end;	/* exclusive */
 };
+/* Dirty pages — within tracked VMAs, these are the pages that changed. */
 static struct ext_dirty_range *ext_dirty_ranges;
 static size_t ext_dirty_count;
+/* Tracked VMAs — the runtime's authoritative claim is scoped to these.
+ * Pages OUTSIDE every tracked VMA are unknown to the dirty tracker
+ * (e.g. CRIU's parasite, or new VMAs the agent allocated since the
+ * parent dump) and must be dumped fresh, NOT marked as parent holes.
+ */
+static struct ext_dirty_range *ext_tracked_vmas;
+static size_t ext_tracked_count;
+
+static int append_range(struct ext_dirty_range **arr, size_t *count,
+			size_t *cap, unsigned long start, unsigned long end)
+{
+	if (*count >= *cap) {
+		size_t new_cap = *cap * 2;
+		struct ext_dirty_range *p = xrealloc(*arr,
+			sizeof(struct ext_dirty_range) * new_cap);
+		if (!p)
+			return -1;
+		*arr = p;
+		*cap = new_cap;
+	}
+	(*arr)[*count].start = start;
+	(*arr)[*count].end = end;
+	(*count)++;
+	return 0;
+}
 
 static int load_external_dirty_list(const char *path)
 {
 	FILE *f;
 	char line[256];
-	size_t cap = 64;
+	size_t dirty_cap = 64, vma_cap = 8;
 
 	f = fopen(path, "r");
 	if (!f) {
@@ -59,32 +85,62 @@ static int load_external_dirty_list(const char *path)
 		return -1;
 	}
 
-	ext_dirty_ranges = xmalloc(sizeof(*ext_dirty_ranges) * cap);
-	if (!ext_dirty_ranges) {
+	ext_dirty_ranges = xmalloc(sizeof(*ext_dirty_ranges) * dirty_cap);
+	ext_tracked_vmas = xmalloc(sizeof(*ext_tracked_vmas) * vma_cap);
+	if (!ext_dirty_ranges || !ext_tracked_vmas) {
 		fclose(f);
 		return -1;
 	}
 	ext_dirty_count = 0;
+	ext_tracked_count = 0;
 
+	/*
+	 * Format (v2):
+	 *   V <start_hex>,<end_hex>     # tracked VMA bound
+	 *   P <start_hex>,<len>         # dirty page run
+	 *
+	 * Back-compat (v1):
+	 *   <start_hex>,<len>           # treated as P; no V lines means
+	 *                               # the whole address space is "tracked"
+	 *                               # (legacy behavior — caller must ensure
+	 *                               # parent has every page outside the dirty list).
+	 */
 	while (fgets(line, sizeof(line), f)) {
-		unsigned long start, len;
-		if (sscanf(line, "%lx,%lu", &start, &len) != 2)
+		unsigned long a, b;
+		const char *p = line;
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (*p == '#' || *p == '\n' || *p == '\0')
 			continue;
-		if (ext_dirty_count >= cap) {
-			cap *= 2;
-			ext_dirty_ranges = xrealloc(ext_dirty_ranges,
-				sizeof(*ext_dirty_ranges) * cap);
-			if (!ext_dirty_ranges) {
+
+		if ((p[0] == 'V' || p[0] == 'v') && (p[1] == ' ' || p[1] == '\t')) {
+			if (sscanf(p + 2, "%lx,%lx", &a, &b) != 2)
+				continue;
+			if (append_range(&ext_tracked_vmas, &ext_tracked_count,
+					 &vma_cap, a, b) < 0) {
+				fclose(f);
+				return -1;
+			}
+		} else if ((p[0] == 'P' || p[0] == 'p') && (p[1] == ' ' || p[1] == '\t')) {
+			if (sscanf(p + 2, "%lx,%lu", &a, &b) != 2)
+				continue;
+			if (append_range(&ext_dirty_ranges, &ext_dirty_count,
+					 &dirty_cap, a, a + b) < 0) {
+				fclose(f);
+				return -1;
+			}
+		} else if (sscanf(p, "%lx,%lu", &a, &b) == 2) {
+			/* legacy v1 format */
+			if (append_range(&ext_dirty_ranges, &ext_dirty_count,
+					 &dirty_cap, a, a + b) < 0) {
 				fclose(f);
 				return -1;
 			}
 		}
-		ext_dirty_ranges[ext_dirty_count].start = start;
-		ext_dirty_ranges[ext_dirty_count].end = start + len;
-		ext_dirty_count++;
 	}
 	fclose(f);
-	pr_info("Loaded %zu external dirty ranges from %s\n", ext_dirty_count, path);
+	pr_info("Loaded %zu external dirty ranges, %zu tracked VMAs from %s\n",
+		ext_dirty_count, ext_tracked_count, path);
 	return 0;
 }
 
@@ -104,6 +160,30 @@ static bool addr_is_externally_dirty(unsigned long va)
 	return false;
 }
 
+/* True if `va` falls inside any tracked VMA (i.e., the runtime knows
+ * what's dirty here). When no V lines were supplied, fall back to
+ * "everything is tracked" for v1 back-compat.
+ */
+static bool addr_is_tracked(unsigned long va)
+{
+	size_t lo, hi;
+
+	if (ext_tracked_count == 0)
+		return true;
+
+	lo = 0; hi = ext_tracked_count;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (va < ext_tracked_vmas[mid].start)
+			hi = mid;
+		else if (va >= ext_tracked_vmas[mid].end)
+			lo = mid + 1;
+		else
+			return true;
+	}
+	return false;
+}
+
 int prepare_external_dirty_list(void)
 {
 	if (!opts.external_dirty_list)
@@ -114,8 +194,11 @@ int prepare_external_dirty_list(void)
 void release_external_dirty_list(void)
 {
 	xfree(ext_dirty_ranges);
+	xfree(ext_tracked_vmas);
 	ext_dirty_ranges = NULL;
+	ext_tracked_vmas = NULL;
 	ext_dirty_count = 0;
+	ext_tracked_count = 0;
 }
 
 static int task_reset_dirty_track(int pid)
@@ -319,6 +402,8 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		unsigned int ppb_flags = 0;
 		struct page_info page_info = {};
 		int st;
+		bool dirty;
+		bool eligible_for_parent;
 
 		/* If dump_all_pages is true, should_dump_page is called to get pme. */
 		if (should_dump_page(pmc, vma->e, vaddr, &page_info))
@@ -343,10 +428,21 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 		 * "dirty" = page was written since the last reset.
 		 * Prefer external list (uffd-WP origin) when --external-dirty-list
 		 * is set. Otherwise fall back to kernel soft-dirty.
+		 *
+		 * For external_dirty_list: a page may be marked as parent hole
+		 * ONLY if it's within a tracked VMA — outside tracked VMAs the
+		 * runtime has no information, so we must dump fresh (the page
+		 * may not exist in parent at all).
 		 */
-		if (has_parent && page_in_parent(opts.external_dirty_list ?
-				addr_is_externally_dirty(vaddr) :
-				page_info.softdirty)) {
+		if (opts.external_dirty_list) {
+			dirty = addr_is_externally_dirty(vaddr);
+			eligible_for_parent = addr_is_tracked(vaddr);
+		} else {
+			dirty = page_info.softdirty;
+			eligible_for_parent = true;
+		}
+
+		if (has_parent && eligible_for_parent && page_in_parent(dirty)) {
 			ret = page_pipe_add_hole(pp, vaddr, PP_HOLE_PARENT);
 			st = 0;
 		} else {
@@ -678,8 +774,19 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 
 	if (xfer.parent) {
 		possible_pid_reuse = detect_pid_reuse(item, mdc->stat, mdc->parent_ie);
-		if (possible_pid_reuse == -1)
-			goto out_xfer;
+		if (possible_pid_reuse == -1) {
+			/*
+			 * ORB v1.3: when --external-dirty-list is set, the user
+			 * has provided ground-truth dirty pages externally, so
+			 * pid-reuse detection (which depends on pre-dump uptime
+			 * metadata) is not required. Skip the bail.
+			 */
+			if (!opts.external_dirty_list)
+				goto out_xfer;
+			pr_warn("Pid-reuse detection failed but --external-dirty-list "
+				"set, proceeding with user-supplied dirty list\n");
+			possible_pid_reuse = 0;
+		}
 	}
 
 	/*

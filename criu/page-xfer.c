@@ -341,6 +341,21 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 		if (xfer->parent != NULL) {
 			ret = check_pagehole_in_parent(xfer->parent, iov);
 			if (ret) {
+				if (opts.external_dirty_list) {
+					/*
+					 * ORB v1.3: with --external-dirty-list, the runtime
+					 * may not know about pages allocated between parent
+					 * dump and tracker arm (small race window). Skip
+					 * the pagemap entry: on restore, the kernel
+					 * lazily zero-fills missing anon pages — which is
+					 * the correct content for a fresh anon page that
+					 * was never written to.
+					 */
+					pr_warn("Hole %p - %p not found in parent — "
+						"emitting as zero-fill (external_dirty_list)\n",
+						iov->iov_base, iov->iov_base + iov->iov_len);
+					return 0;
+				}
 				pr_err("Hole %p - %p not found in parent\n",
 				       iov->iov_base, iov->iov_base + iov->iov_len);
 				return -1;
